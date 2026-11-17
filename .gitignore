@@ -1,0 +1,13 @@
+node_modules/
+build/
+dist/
+out/
+.tmp/
+.playwright-cli/
+coverage/
+*.vsix
+.DS_Store
+*.log
+.env*
+.vscode/
+.vsix

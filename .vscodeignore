@@ -1,0 +1,24 @@
+# Everything is bundled: esbuild -> out/extension.js, vite -> dist/*.
+# Nothing under node_modules is required at extension runtime.
+node_modules/**
+src/**
+docs/**
+.aistudio/**
+.vscode/**
+.vscode-test/**
+.tmp/**
+.playwright-cli/**
+
+# Build/config sources that must not ship
+index.html
+*.pdf
+vite.config.*
+tsconfig.json
+tsconfig.*.json
+**/*.tsbuildinfo
+**/*.map
+package-lock.json
+bun.lock
+.env*
+.gitignore
+*.vsix
