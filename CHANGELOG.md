@@ -2,6 +2,14 @@
 
 All notable changes to this extension are documented in this file.
 
+## [1.0.1]
+
+### 优化
+
+- 界面文字调整为 12–13px 系统字体，提高文字对比度，改善小字发虚的观感。
+- 移除外部字体加载，优化侧栏标签和页码输入框的排布。
+- 保留 PDF 原始字体和渲染参数。
+
 ## [1.0.0]
 
 ### Added

@@ -1,10 +1,10 @@
 import * as pdfjsLib from 'pdfjs-dist';
 import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 import type { PDFDocumentProxy, PageViewport } from 'pdfjs-dist';
-import type { TextItem } from 'pdfjs-dist/types/src/display/api';
 import { OutlineNode } from './pdfState';
 import {
-  buildExtractedPageFromTextItems,
+  extractPdfTextIndex,
+  PdfTextIndexOptions,
   ExtractedPdfPage,
   ExtractedPdfTextItem,
   PdfSearchMatch,
@@ -30,20 +30,44 @@ export interface LoadedPdfHandle {
   destroy: () => Promise<void>;
 }
 
-export async function loadPdfDocumentFromBytes(bytes: Uint8Array): Promise<LoadedPdfHandle> {
+export async function loadPdfDocumentFromBytes(
+  bytes: Uint8Array,
+  signal?: AbortSignal,
+  onStage?: (stage: 'worker' | 'parsing') => void,
+): Promise<LoadedPdfHandle> {
+  signal?.throwIfAborted();
   ensurePdfWorkerConfigured();
-  // Clone bytes so pdfjs transferring the buffer to worker does not detach caller's copy
-  const copy = new Uint8Array(bytes);
-  const loadingTask = pdfjsLib.getDocument({
-    data: copy,
-    useWorkerFetch: false,
-    verbosity: 0,
-  });
-  const doc = await loadingTask.promise;
-  return {
-    doc,
-    destroy: () => loadingTask.destroy(),
+  onStage?.('worker');
+  // 显式等待公开的 Worker 就绪 Promise，单独测量启动与解析，避免猜测私有消息。
+  const worker = new pdfjsLib.PDFWorker({ verbosity: 0 });
+  let loadingTask: ReturnType<typeof pdfjsLib.getDocument> | undefined;
+  let destruction: Promise<void> | undefined;
+  const destroy = () => destruction ??= (async () => {
+    try { await loadingTask?.destroy(); }
+    finally { worker.destroy(); }
+  })();
+  let rejectAbort: (reason: unknown) => void;
+  const aborted = new Promise<never>((_, reject) => { rejectAbort = reject; });
+  const abort = () => {
+    rejectAbort(signal?.reason);
+    void destroy().catch(() => {});
   };
+  signal?.addEventListener('abort', abort, { once: true });
+  try {
+    await Promise.race([worker.promise, aborted]);
+    signal?.throwIfAborted();
+    onStage?.('parsing');
+    // 将字节缓冲区所有权交给 PDF.js worker，避免大文件在 Webview 中再次整份复制。
+    loadingTask = pdfjsLib.getDocument({ data: bytes, worker, useWorkerFetch: false, verbosity: 0 });
+    const doc = await Promise.race([loadingTask.promise, aborted]);
+    signal?.throwIfAborted();
+    return { doc, destroy };
+  } catch (error) {
+    await destroy().catch(() => {});
+    throw error;
+  } finally {
+    signal?.removeEventListener('abort', abort);
+  }
 }
 
 async function resolveDestPageNumber(
@@ -125,30 +149,12 @@ export async function extractOutlineFromPdf(
   });
 }
 
-export async function extractAllPagesText(
+export function extractAllPagesText(
   pdfDoc: PDFDocumentProxy,
-  sectionTitlesByPage?: Record<number, string>
+  sectionTitlesByPage?: Record<number, string>,
+  options?: PdfTextIndexOptions
 ): Promise<ExtractedPdfPage[]> {
-  const pages: ExtractedPdfPage[] = [];
-
-  for (let p = 1; p <= pdfDoc.numPages; p++) {
-    const page = await pdfDoc.getPage(p);
-    const tc = await page.getTextContent();
-    const rawItems = tc.items
-      .filter((item): item is TextItem => 'str' in item && 'transform' in item)
-      .map((item) => ({
-        str: item.str,
-        transform: item.transform,
-        width: item.width,
-        height: item.height,
-        hasEOL: item.hasEOL,
-      }));
-    pages.push(
-      buildExtractedPageFromTextItems(p, rawItems, sectionTitlesByPage?.[p])
-    );
-  }
-
-  return pages;
+  return extractPdfTextIndex(pdfDoc, sectionTitlesByPage, options);
 }
 
 export interface ViewportHighlightRect {

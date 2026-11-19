@@ -1,11 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import * as pdfjsLib from 'pdfjs-dist/legacy/build/pdf.mjs';
-import type { TextItem } from 'pdfjs-dist/types/src/display/api';
+import type { PDFDocumentProxy } from 'pdfjs-dist';
 import { buildSamplePdfBytes } from './samplePdfBuilder';
 import {
-  buildExtractedPageFromTextItems,
   ExtractedPdfPage,
+  extractPdfTextIndex,
   searchPdfPages,
   stepMatchIndex,
 } from './pdfSearch';
@@ -17,26 +17,12 @@ async function extractRealSamplePages(): Promise<ExtractedPdfPage[]> {
     useWorkerFetch: false,
     verbosity: 0,
   });
-  const doc = await loadingTask.promise;
-  const pages: ExtractedPdfPage[] = [];
-
-  for (let p = 1; p <= doc.numPages; p++) {
-    const page = await doc.getPage(p);
-    const tc = await page.getTextContent();
-    const rawItems = tc.items
-      .filter((item): item is TextItem => 'str' in item && 'transform' in item)
-      .map((item) => ({
-        str: item.str,
-        transform: item.transform,
-        width: item.width,
-        height: item.height,
-        hasEOL: item.hasEOL,
-      }));
-    pages.push(buildExtractedPageFromTextItems(p, rawItems));
+  try {
+    const doc = await loadingTask.promise;
+    return await extractPdfTextIndex(doc);
+  } finally {
+    await loadingTask.destroy();
   }
-
-  await loadingTask.destroy();
-  return pages;
 }
 
 test('searchPdfPages finds matches across all 15 real PDF pages and maps itemSpans', async () => {
@@ -89,6 +75,80 @@ test('searchPdfPages escapes special regex characters safely', async () => {
     wholeWord: false,
   });
   assert.ok(result.totalMatches >= 2);
+});
+
+function mockIndexDocument(count: number, failurePage = -1) {
+  const visited: number[] = [];
+  const doc = {
+    numPages: count,
+    getPage: async (page: number) => {
+      visited.push(page);
+      if (page === failurePage) throw new Error('损坏的文本页');
+      return { getTextContent: async () => ({
+        items: [{ str: `needle${page}`, transform: [1, 0, 0, 12, 40, 700], width: 60, height: 12 }],
+      }) };
+    },
+  } as unknown as Pick<PDFDocumentProxy, 'numPages' | 'getPage'>;
+  return { doc, visited };
+}
+
+test('后台索引在全文完成前发布独立快照，并保持全文搜索页码', async () => {
+  const { doc } = mockIndexDocument(25);
+  const updates: ExtractedPdfPage[][] = [];
+  let yielded = false;
+  setTimeout(() => { yielded = true; }, 0);
+  const pages = await extractPdfTextIndex(doc, undefined, {
+    onProgress: (snapshot) => updates.push(snapshot),
+  });
+  assert.equal(updates[0].length, 1);
+  assert.equal(updates.at(-1)?.length, 25);
+  assert.equal(yielded, true);
+  assert.notEqual(updates.at(-1), pages);
+  const result = searchPdfPages(pages, 'needle25', { caseSensitive: false, wholeWord: true });
+  assert.equal(result.totalMatches, 1);
+  assert.equal(result.flatMatches[0].page, 25);
+});
+
+test('取消后台索引后停止读取后续页并且不发布迟到结果', async () => {
+  const { doc, visited } = mockIndexDocument(25);
+  const controller = new AbortController();
+  const updates: number[] = [];
+  await assert.rejects(extractPdfTextIndex(doc, undefined, {
+    signal: controller.signal,
+    onProgress: (pages) => {
+      updates.push(pages.length);
+      controller.abort();
+    },
+  }), { name: 'AbortError' });
+  assert.deepEqual(visited, [1]);
+  assert.deepEqual(updates, [1]);
+});
+
+test('索引取消发生在文本提取期间时也不发布该页', async () => {
+  const controller = new AbortController();
+  const doc = { numPages: 1, getPage: async () => ({ getTextContent: async () => {
+    controller.abort();
+    return { items: [] };
+  } }) } as unknown as Pick<PDFDocumentProxy, 'numPages' | 'getPage'>;
+  let published = false;
+  await assert.rejects(extractPdfTextIndex(doc, undefined, {
+    signal: controller.signal,
+    onProgress: () => { published = true; },
+  }), { name: 'AbortError' });
+  assert.equal(published, false);
+});
+
+test('单页提取失败仍保留页码占位并继续索引，报告失败页', async () => {
+  const { doc } = mockIndexDocument(9, 2);
+  let failed: number[] = [];
+  const pages = await extractPdfTextIndex(doc, undefined, {
+    onProgress: (_, failures) => { failed = failures; },
+  });
+  assert.equal(pages.length, 9);
+  assert.equal(pages[1].page, 2);
+  assert.equal(pages[1].fullText, '');
+  assert.equal(pages[8].fullText, 'needle9');
+  assert.deepEqual(failed, [2]);
 });
 
 test('stepMatchIndex wraps cleanly in both directions', () => {

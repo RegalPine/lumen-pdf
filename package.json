@@ -2,7 +2,7 @@
   "name": "lumen-pdf",
   "displayName": "Lumen PDF",
   "description": "Lumen PDF — a VS Code Custom Editor for reading and searching PDF documents, with SyncTeX navigation, Dark Paper reading mode, and full-text search.",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "publisher": "lumen-pdf",
   "private": true,
   "license": "MIT",
@@ -41,6 +41,10 @@
     ],
     "commands": [
       {
+        "command": "pdfReader.showLoadDiagnostics",
+        "title": "Lumen PDF: 显示加载诊断"
+      },
+      {
         "command": "pdfReader.toggleColorMode",
         "title": "Lumen PDF: Cycle Reading Color Mode"
       }
@@ -54,7 +58,7 @@
     "watch:webview": "vite build --watch",
     "watch:ext": "esbuild src/extension/extension.ts --bundle --outfile=out/extension.js --external:vscode --format=cjs --platform=node --sourcemap --watch",
     "lint": "tsc -b --noEmit",
-    "test": "node --import tsx --test src/webview/utils/pdfSearch.test.ts src/webview/utils/samplePdfBuilder.test.ts src/extension/webviewHtml.test.ts",
+    "test": "node --import tsx --test src/webview/utils/pdfSearch.test.ts src/webview/utils/samplePdfBuilder.test.ts src/webview/utils/vscodeBridge.test.ts src/webview/utils/pdfLoadDiagnostics.test.ts src/webview/utils/pdfRenderScheduling.test.ts src/extension/webviewHtml.test.ts src/extension/extension.test.ts",
     "vscode:prepublish": "npm run build:all",
     "package": "npm run lint && npm run build:all && vsce package --allow-missing-repository",
     "preview": "vite preview"

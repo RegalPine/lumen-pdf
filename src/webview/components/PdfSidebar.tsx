@@ -28,17 +28,21 @@ export type PdfSidebarTab =
   | 'search';
 
 interface PdfSidebarProps {
+  headerHeight: number;
   activeTab: PdfSidebarTab;
   onSelectTab: (tab: PdfSidebarTab) => void;
   pdfDoc: PDFDocumentProxy | null;
   totalPages: number;
   colorMode: ReadingColorMode;
   outline: OutlineNode[];
+  isOutlineLoading: boolean;
+  backgroundWorkEnabled: boolean;
   currentPage: number;
   annotations: PdfAnnotation[];
   bookmarks: PdfBookmark[];
   searchQuery: string;
   searchResult: PdfSearchResult;
+  searchIndexStatus: string | null;
   activeMatchIndex: number;
   onJumpToPage: (page: number) => void;
   onAddAnnotation: (page: number, excerpt: string, note: string) => void;
@@ -48,17 +52,21 @@ interface PdfSidebarProps {
 }
 
 export const PdfSidebar: React.FC<PdfSidebarProps> = ({
+  headerHeight,
   activeTab,
   onSelectTab,
   pdfDoc,
   totalPages,
   colorMode,
   outline,
+  isOutlineLoading,
+  backgroundWorkEnabled,
   currentPage,
   annotations,
   bookmarks,
   searchQuery,
   searchResult,
+  searchIndexStatus,
   activeMatchIndex,
   onJumpToPage,
   onAddAnnotation,
@@ -86,7 +94,15 @@ export const PdfSidebar: React.FC<PdfSidebarProps> = ({
 
   const expandAll = () => {
     const next: Record<string, boolean> = {};
-    for (const node of outline) next[node.id] = true;
+    const visit = (nodes: OutlineNode[]) => {
+      for (const node of nodes) {
+        if (node.children?.length) {
+          next[node.id] = true;
+          visit(node.children);
+        }
+      }
+    };
+    visit(outline);
     setExpandedIds(next);
   };
 
@@ -111,12 +127,64 @@ export const PdfSidebar: React.FC<PdfSidebarProps> = ({
     [totalPages]
   );
 
+  const renderOutlineNode = (node: OutlineNode): React.ReactNode => {
+    const hasChildren = Boolean(node.children?.length);
+    const isExpanded = Boolean(expandedIds[node.id] || outlineQuery.trim());
+    const isCurrentSection = currentPage === node.page;
+
+    return (
+      <div key={node.id}>
+        <div className="flex items-start">
+          {hasChildren ? (
+            <button
+              type="button"
+              onClick={() => toggleNode(node.id)}
+              aria-label={`Toggle ${node.title}`}
+              aria-expanded={isExpanded}
+              className="p-1 mt-0.5 shrink-0 text-on-surface-variant hover:text-primary"
+            >
+              {isExpanded ? (
+                <ChevronDown className="w-3.5 h-3.5" aria-hidden="true" />
+              ) : (
+                <ChevronRight className="w-3.5 h-3.5" aria-hidden="true" />
+              )}
+            </button>
+          ) : (
+            <span className="w-5 shrink-0 inline-block" />
+          )}
+          <button
+            type="button"
+            onClick={() => onJumpToPage(node.page)}
+            onDoubleClick={hasChildren ? () => toggleNode(node.id) : undefined}
+            aria-expanded={hasChildren ? isExpanded : undefined}
+            className={`flex-1 flex items-start justify-between px-1.5 py-1 text-left min-w-0 transition-colors ${
+              isCurrentSection
+                ? 'text-primary bg-surface-container-high font-semibold'
+                : 'text-on-surface hover:text-primary hover:bg-surface-container'
+            }`}
+          >
+            <span className="min-w-0 flex-1 whitespace-normal break-words">{node.title}</span>
+            <span className="text-xs text-outline tabular-nums ml-2 mt-0.5 shrink-0">
+              p. {node.page}
+            </span>
+          </button>
+        </div>
+        {isExpanded && hasChildren && (
+          <div className="pl-5 space-y-0.5 border-l border-surface-container-high ml-2.5">
+            {node.children!.map(renderOutlineNode)}
+          </div>
+        )}
+      </div>
+    );
+  };
+
   return (
     <div className="flex flex-col h-full">
       {/* Sub-Tabs */}
       <nav
         aria-label="PDF Sidebar Sections"
-        className="h-8 bg-surface-container border-b border-outline-variant/30 flex items-center justify-between px-1 gap-0.5 shrink-0"
+        style={{ height: headerHeight }}
+        className="min-w-0 overflow-x-auto bg-surface-container border-b border-outline-variant/30 flex items-center justify-between px-1 gap-0.5 shrink-0"
       >
         {(
           [
@@ -133,7 +201,7 @@ export const PdfSidebar: React.FC<PdfSidebarProps> = ({
               key={tab.id}
               type="button"
               onClick={() => onSelectTab(tab.id)}
-              className={`px-1.5 py-1 font-mono text-[10px] text-center whitespace-nowrap transition-colors border-b-2 ${
+              className={`shrink-0 px-1.5 py-1 font-sans text-xs font-medium text-center whitespace-nowrap transition-colors border-b-2 ${
                 active
                   ? 'text-primary bg-surface-container-high border-primary font-bold'
                   : 'text-on-surface-variant hover:text-on-surface hover:bg-surface-container-high border-transparent'
@@ -157,7 +225,7 @@ export const PdfSidebar: React.FC<PdfSidebarProps> = ({
             value={outlineQuery}
             onChange={(e) => setOutlineQuery(e.target.value)}
             placeholder="Filter outline headings..."
-            className="w-full px-2 py-1 bg-surface-container border border-outline-variant/60 text-xs font-mono text-on-surface focus:outline-none focus:border-primary"
+            className="w-full px-2 py-1 bg-surface-container border border-outline-variant/60 text-[13px] font-sans text-on-surface focus:outline-none focus:border-primary"
           />
         </div>
       )}
@@ -203,82 +271,19 @@ export const PdfSidebar: React.FC<PdfSidebarProps> = ({
               </button>
             </div>
 
-            <div className="space-y-0.5 font-mono text-[11px]">
+            <div className="space-y-0.5 font-sans text-[13px] leading-5">
               {filteredOutline.length === 0 ? (
-                <p className="px-2 py-3 text-outline text-xs">
+                <p className="px-2 py-3 text-outline text-[13px]">
                   {totalPages === 0
                     ? 'Loading document…'
-                    : outline.length === 0
-                      ? 'This document has no outline entries.'
-                      : 'No matching sections.'}
+                    : isOutlineLoading
+                      ? backgroundWorkEnabled ? '正在加载目录…' : '首屏完成后加载目录…'
+                      : outline.length === 0
+                        ? 'This document has no outline entries.'
+                        : 'No matching sections.'}
                 </p>
               ) : (
-                filteredOutline.map((node) => {
-                  const isExpanded = Boolean(expandedIds[node.id] || outlineQuery.trim());
-                  const isCurrentSection = currentPage === node.page;
-                  return (
-                    <div key={node.id}>
-                      <div className="flex items-center">
-                        {node.children && node.children.length > 0 ? (
-                          <button
-                            type="button"
-                            onClick={() => toggleNode(node.id)}
-                            aria-label={`Toggle ${node.title}`}
-                            aria-expanded={isExpanded}
-                            className="p-1 text-on-surface-variant hover:text-primary"
-                          >
-                            {isExpanded ? (
-                              <ChevronDown className="w-3.5 h-3.5" aria-hidden="true" />
-                            ) : (
-                              <ChevronRight className="w-3.5 h-3.5" aria-hidden="true" />
-                            )}
-                          </button>
-                        ) : (
-                          <span className="w-5 inline-block" />
-                        )}
-                        <button
-                          type="button"
-                          onClick={() => onJumpToPage(node.page)}
-                          className={`flex-1 flex items-center justify-between px-1.5 py-1 text-left min-w-0 transition-colors ${
-                            isCurrentSection
-                              ? 'text-primary bg-surface-container-high font-semibold'
-                              : 'text-on-surface hover:text-primary hover:bg-surface-container'
-                          }`}
-                        >
-                          <span className="truncate">{node.title}</span>
-                          <span className="text-[10px] text-outline tabular-nums ml-2 shrink-0">
-                            p. {node.page}
-                          </span>
-                        </button>
-                      </div>
-
-                      {isExpanded && node.children && (
-                        <div className="pl-5 space-y-0.5 border-l border-surface-container-high ml-2.5">
-                          {node.children.map((child) => {
-                            const childActive = currentPage === child.page;
-                            return (
-                              <button
-                                key={child.id}
-                                type="button"
-                                onClick={() => onJumpToPage(child.page)}
-                                className={`w-full flex items-center justify-between px-2 py-1 text-left transition-colors ${
-                                  childActive
-                                    ? 'text-primary bg-surface-container font-semibold'
-                                    : 'text-on-surface-variant hover:text-on-surface hover:bg-surface-container'
-                                }`}
-                              >
-                                <span className="truncate">{child.title}</span>
-                                <span className="text-[10px] text-outline tabular-nums ml-2 shrink-0">
-                                  p. {child.page}
-                                </span>
-                              </button>
-                            );
-                          })}
-                        </div>
-                      )}
-                    </div>
-                  );
-                })
+                filteredOutline.map(renderOutlineNode)
               )}
             </div>
           </>
@@ -286,7 +291,7 @@ export const PdfSidebar: React.FC<PdfSidebarProps> = ({
 
         {activeTab === 'thumbnails' && (
           <div className="grid grid-cols-2 gap-2">
-            {pdfDoc ? (
+            {pdfDoc && backgroundWorkEnabled ? (
               pageNumbers.map((pageNum) => (
                 <PdfThumbnailItem
                   key={pageNum}
@@ -298,8 +303,8 @@ export const PdfSidebar: React.FC<PdfSidebarProps> = ({
                 />
               ))
             ) : (
-              <p className="col-span-2 text-xs font-mono text-outline px-1">
-                Loading page thumbnails...
+              <p className="col-span-2 text-[13px] font-sans text-outline px-1">
+                {pdfDoc && !backgroundWorkEnabled ? '首屏完成后加载缩略图…' : '正在加载缩略图…'}
               </p>
             )}
           </div>
@@ -311,7 +316,7 @@ export const PdfSidebar: React.FC<PdfSidebarProps> = ({
               onSubmit={handleCreateNote}
               className="space-y-2 bg-surface-container p-2 border border-outline-variant/40"
             >
-              <div className="font-mono text-[10px] uppercase text-primary font-bold">
+              <div className="font-sans text-xs uppercase text-primary font-bold">
                 Add Note on Page {currentPage}
               </div>
               <label htmlFor="ann-excerpt" className="sr-only">
@@ -323,7 +328,7 @@ export const PdfSidebar: React.FC<PdfSidebarProps> = ({
                 value={newNoteExcerpt}
                 onChange={(e) => setNewNoteExcerpt(e.target.value)}
                 placeholder="Excerpt (optional)..."
-                className="w-full px-2 py-1 bg-surface-container-lowest border border-outline-variant/50 text-xs font-mono text-on-surface focus:outline-none focus:border-primary"
+                className="w-full px-2 py-1 bg-surface-container-lowest border border-outline-variant/50 text-[13px] font-sans text-on-surface focus:outline-none focus:border-primary"
               />
               <label htmlFor="ann-note" className="sr-only">
                 Annotation note
@@ -334,11 +339,11 @@ export const PdfSidebar: React.FC<PdfSidebarProps> = ({
                 value={newNoteText}
                 onChange={(e) => setNewNoteText(e.target.value)}
                 placeholder="Write annotation note..."
-                className="w-full px-2 py-1 bg-surface-container-lowest border border-outline-variant/50 text-xs text-on-surface focus:outline-none focus:border-primary resize-none"
+                className="w-full px-2 py-1 bg-surface-container-lowest border border-outline-variant/50 text-[13px] text-on-surface focus:outline-none focus:border-primary resize-none"
               />
               <button
                 type="submit"
-                className="w-full h-7 bg-primary-container hover:bg-primary text-on-primary-fixed font-mono text-[11px] font-bold uppercase flex items-center justify-center gap-1 transition-colors"
+                className="w-full h-7 bg-primary-container hover:bg-primary text-on-primary-fixed font-sans text-[13px] font-bold uppercase flex items-center justify-center gap-1 transition-colors"
               >
                 <Plus className="w-3.5 h-3.5" aria-hidden="true" />
                 <span>Save Annotation</span>
@@ -347,7 +352,7 @@ export const PdfSidebar: React.FC<PdfSidebarProps> = ({
 
             <div className="space-y-2">
               {annotations.length === 0 ? (
-                <p className="text-xs font-mono text-outline px-1">
+                <p className="text-[13px] font-sans text-outline px-1">
                   No annotations yet. Select PDF text and click Highlight, or add a note above.
                 </p>
               ) : (
@@ -360,7 +365,7 @@ export const PdfSidebar: React.FC<PdfSidebarProps> = ({
                       <button
                         type="button"
                         onClick={() => onJumpToPage(ann.page)}
-                        className="font-mono text-[10px] text-tertiary hover:underline tabular-nums"
+                        className="font-sans text-xs text-tertiary hover:underline tabular-nums"
                       >
                         Page {ann.page} · {ann.createdAt}
                       </button>
@@ -373,10 +378,10 @@ export const PdfSidebar: React.FC<PdfSidebarProps> = ({
                         <Trash2 className="w-3.5 h-3.5" aria-hidden="true" />
                       </button>
                     </div>
-                    <p className="text-[11px] font-serif italic text-on-surface-variant line-clamp-2">
+                    <p className="text-[13px] font-sans italic text-on-surface-variant line-clamp-2">
                       "{ann.excerpt}"
                     </p>
-                    <p className="text-xs text-on-surface">{ann.note}</p>
+                    <p className="text-[13px] text-on-surface">{ann.note}</p>
                   </div>
                 ))
               )}
@@ -389,13 +394,13 @@ export const PdfSidebar: React.FC<PdfSidebarProps> = ({
             <button
               type="button"
               onClick={onToggleCurrentBookmark}
-              className="w-full h-7 bg-surface-container hover:bg-surface-container-high border border-primary/60 text-primary font-mono text-[11px] font-bold uppercase flex items-center justify-center gap-1.5 transition-colors"
+              className="w-full h-7 bg-surface-container hover:bg-surface-container-high border border-primary/60 text-primary font-sans text-[13px] font-bold uppercase flex items-center justify-center gap-1.5 transition-colors"
             >
               <Bookmark className="w-3.5 h-3.5" aria-hidden="true" />
               <span>Toggle Pin for Page {currentPage}</span>
             </button>
             {bookmarks.length === 0 ? (
-              <p className="text-xs font-mono text-outline px-1 py-2">
+              <p className="text-[13px] font-sans text-outline px-1 py-2">
                 No bookmarks pinned for this PDF yet.
               </p>
             ) : (
@@ -407,14 +412,14 @@ export const PdfSidebar: React.FC<PdfSidebarProps> = ({
                   className="w-full text-left bg-surface-container hover:bg-surface-container-high border border-outline-variant/40 p-2 transition-colors"
                 >
                   <div className="flex items-center justify-between">
-                    <span className="text-xs font-semibold text-on-surface truncate">
+                    <span className="text-[13px] font-semibold text-on-surface truncate">
                       {bm.title}
                     </span>
-                    <span className="font-mono text-[10px] text-primary tabular-nums">
+                    <span className="font-sans text-xs text-primary tabular-nums">
                       p. {bm.page}
                     </span>
                   </div>
-                  <div className="text-[10px] font-mono text-outline mt-0.5 truncate">
+                  <div className="text-xs font-sans text-outline mt-0.5 truncate">
                     {bm.subtitle}
                   </div>
                 </button>
@@ -427,24 +432,29 @@ export const PdfSidebar: React.FC<PdfSidebarProps> = ({
           <div className="space-y-3">
             {/* Result overview only — the input, toggles and stepping live in
                 the viewport find bar (Ctrl+F) to avoid two competing inputs. */}
+            {searchIndexStatus && (
+              <p role="status" className="px-2 font-sans text-xs text-outline">
+                {searchIndexStatus}
+              </p>
+            )}
             {!searchQuery.trim() ? (
               <div className="p-2.5 bg-surface-container border border-outline-variant/30">
-                <p className="font-mono text-[11px] text-on-surface-variant">
+                <p className="font-sans text-[13px] text-on-surface-variant">
                   Press Ctrl+F and enter a keyword to search across all {totalPages} pages.
                 </p>
               </div>
             ) : searchResult.totalMatches === 0 ? (
               <div className="p-3 bg-surface-container border border-outline-variant/30 space-y-1">
-                <p className="font-mono text-xs text-error">
-                  No occurrences found for "{searchQuery}".
+                <p className="font-sans text-[13px] text-error">
+                  {searchIndexStatus ? `已索引页面中暂无匹配：${searchQuery}` : `No occurrences found for "${searchQuery}".`}
                 </p>
-                <p className="text-[11px] text-outline">
-                  Adjust the Aa / \b toggles in the find bar above the page.
+                <p className="text-[13px] text-outline">
+                  {searchIndexStatus ? '索引未完成或存在无法提取文本的页面，请留意上方状态。' : 'Adjust the Aa / \\b toggles in the find bar above the page.'}
                 </p>
               </div>
             ) : (
               <div className="space-y-2.5">
-                <div className="px-1 font-mono text-[10px] uppercase tracking-wider text-outline tabular-nums">
+                <div className="px-1 font-sans text-xs uppercase tracking-wider text-outline tabular-nums">
                   {searchResult.totalMatches} matches across {searchResult.pageGroups.length} pages
                 </div>
 
@@ -454,10 +464,10 @@ export const PdfSidebar: React.FC<PdfSidebarProps> = ({
                     className="border border-outline-variant/40 bg-surface-container"
                   >
                     <div className="px-2 py-1 bg-surface-container-high border-b border-outline-variant/30 flex items-center justify-between gap-2">
-                      <span className="font-mono text-[11px] font-bold text-on-surface truncate">
+                      <span className="font-sans text-[13px] font-bold text-on-surface truncate">
                         Page {group.page} · {group.sectionTitle}
                       </span>
-                      <span className="font-mono text-[10px] text-primary tabular-nums shrink-0">
+                      <span className="font-sans text-xs text-primary tabular-nums shrink-0">
                         {group.matches.length}
                       </span>
                     </div>
@@ -476,7 +486,7 @@ export const PdfSidebar: React.FC<PdfSidebarProps> = ({
                                 : 'border-transparent hover:bg-surface-container-high'
                             }`}
                           >
-                            <div className="text-[11px] text-on-surface-variant leading-snug break-words">
+                            <div className="text-[13px] text-on-surface-variant leading-snug break-words">
                               <span>{match.snippetBefore}</span>
                               <mark
                                 className={

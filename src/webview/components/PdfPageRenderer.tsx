@@ -8,6 +8,8 @@ import { PointerTool, ReadingColorMode } from '../utils/pdfState';
 interface PdfPageRendererProps {
   pdfDoc: PDFDocumentProxy;
   pageNumber: number;
+  renderActive: boolean;
+  onPageRendered: (doc: PDFDocumentProxy, page: number, phase: 'canvas' | 'text' | 'error') => void;
   zoom: number;
   rotation: number;
   colorMode: ReadingColorMode;
@@ -32,9 +34,11 @@ const PAPER_FRAME_BORDER: Record<ReadingColorMode, string> = {
   inverted: 'border-[#3c4a41] bg-[#080808]',
 };
 
-export const PdfPageRenderer: React.FC<PdfPageRendererProps> = ({
+export const PdfPageRenderer = React.memo(function PdfPageRenderer({
   pdfDoc,
   pageNumber,
+  renderActive,
+  onPageRendered,
   zoom,
   rotation,
   colorMode,
@@ -43,13 +47,22 @@ export const PdfPageRenderer: React.FC<PdfPageRendererProps> = ({
   matchesOnPage,
   activeMatchId,
   registerPageElement,
-}) => {
+}: PdfPageRendererProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const textLayerRef = useRef<HTMLDivElement>(null);
   const activeMarkRef = useRef<HTMLDivElement>(null);
 
-  const [viewportState, setViewportState] = useState<PageViewport | null>(null);
+  const renderCompletionRef = useRef<Promise<void> | null>(null);
+  const lastScrolledMatchRef = useRef<string | null>(null);
+  const [baseViewport, setBaseViewport] = useState<PageViewport | null>(null);
+  const [rendered, setRendered] = useState(false);
+  const viewportState = useMemo(
+    () => baseViewport?.clone({ scale: (zoom / 100) * 1.22, rotation }) ?? null,
+    [baseViewport, zoom, rotation]
+  );
+  const fallbackWidth = (rotation % 180 === 0 ? 612 : 792) * (zoom / 100) * 1.22;
+  const fallbackHeight = (rotation % 180 === 0 ? 792 : 612) * (zoom / 100) * 1.22;
   const [renderError, setRenderError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -58,6 +71,11 @@ export const PdfPageRenderer: React.FC<PdfPageRendererProps> = ({
   }, [pageNumber, registerPageElement]);
 
   useEffect(() => {
+    if (!renderActive) return;
+    const canvas = canvasRef.current;
+    const textContainer = textLayerRef.current;
+    if (!canvas || !textContainer) return;
+    const previousRender = renderCompletionRef.current;
     let cancelled = false;
     let renderTask: RenderTask | null = null;
     let textLayerTask: TextLayer | null = null;
@@ -65,17 +83,17 @@ export const PdfPageRenderer: React.FC<PdfPageRendererProps> = ({
     const renderPage = async () => {
       try {
         setRenderError(null);
+        setRendered(false);
+        // 缩放和快速滚动可能连续取消渲染，等待旧任务结束后再使用同一画布。
+        await previousRender;
+        if (cancelled) return;
         const page = await pdfDoc.getPage(pageNumber);
         if (cancelled) return;
 
         // 100% zoom maps PDF 72dpi points comfortably at ~1.22 CSS px for crisp reading
         const baseScale = (zoom / 100) * 1.22;
         const viewport = page.getViewport({ scale: baseScale, rotation });
-        setViewportState(viewport);
-
-        const canvas = canvasRef.current;
-        const textContainer = textLayerRef.current;
-        if (!canvas || !textContainer) return;
+        setBaseViewport(page.getViewport({ scale: 1, rotation: 0 }));
 
         const dpr = Math.min(window.devicePixelRatio || 1, 2);
         canvas.width = Math.max(1, Math.floor(viewport.width * dpr));
@@ -84,7 +102,7 @@ export const PdfPageRenderer: React.FC<PdfPageRendererProps> = ({
         canvas.style.height = `${viewport.height}px`;
 
         const ctx = canvas.getContext('2d');
-        if (!ctx) return;
+        if (!ctx) throw new Error('无法创建 PDF 画布。');
 
         renderTask = page.render({
           canvas,
@@ -95,6 +113,7 @@ export const PdfPageRenderer: React.FC<PdfPageRendererProps> = ({
 
         await renderTask.promise;
         if (cancelled) return;
+        onPageRendered(pdfDoc, pageNumber, 'canvas');
 
         // Render selectable text layer
         textContainer.replaceChildren();
@@ -112,6 +131,10 @@ export const PdfPageRenderer: React.FC<PdfPageRendererProps> = ({
           viewport,
         });
         await textLayerTask.render();
+        if (!cancelled) {
+          setRendered(true);
+          onPageRendered(pdfDoc, pageNumber, 'text');
+        }
       } catch (err) {
         if (cancelled) return;
         const name = err instanceof Error ? err.name : '';
@@ -119,10 +142,11 @@ export const PdfPageRenderer: React.FC<PdfPageRendererProps> = ({
           return;
         }
         setRenderError(err instanceof Error ? err.message : 'Failed to render PDF page.');
+        onPageRendered(pdfDoc, pageNumber, 'error');
       }
     };
 
-    renderPage();
+    renderCompletionRef.current = renderPage();
 
     return () => {
       cancelled = true;
@@ -136,11 +160,15 @@ export const PdfPageRenderer: React.FC<PdfPageRendererProps> = ({
       } catch {
         // ignore cancel races
       }
+      // 离屏仍保留纸张尺寸占位，但立即释放像素缓冲区和文本 DOM。
+      canvas.width = 0;
+      canvas.height = 0;
+      textContainer.replaceChildren();
     };
-  }, [pdfDoc, pageNumber, zoom, rotation]);
+  }, [pdfDoc, pageNumber, zoom, rotation, renderActive, onPageRendered]);
 
   const highlightBoxes = useMemo(() => {
-    if (!viewportState || matchesOnPage.length === 0 || extractedItems.length === 0) {
+    if (!renderActive || !viewportState || matchesOnPage.length === 0 || extractedItems.length === 0) {
       return [];
     }
     return matchesOnPage.flatMap((match) => {
@@ -152,53 +180,39 @@ export const PdfPageRenderer: React.FC<PdfPageRendererProps> = ({
         rect,
       }));
     });
-  }, [activeMatchId, extractedItems, matchesOnPage, viewportState]);
+  }, [activeMatchId, extractedItems, matchesOnPage, viewportState, renderActive]);
 
   useEffect(() => {
-    if (activeMatchId && activeMarkRef.current) {
-      activeMarkRef.current.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    if (!activeMatchId) lastScrolledMatchRef.current = null;
+    if (renderActive && rendered && activeMatchId && activeMarkRef.current && lastScrolledMatchRef.current !== activeMatchId) {
+      lastScrolledMatchRef.current = activeMatchId;
+      activeMarkRef.current.scrollIntoView({ block: 'center', behavior: 'instant' });
     }
-  }, [activeMatchId, pageNumber, viewportState]);
+  }, [activeMatchId, pageNumber, viewportState, renderActive, rendered]);
 
   return (
     <div
       ref={containerRef}
       data-pdf-page={pageNumber}
+      data-render-active={renderActive}
+      data-rendered={renderActive && rendered}
       aria-label={`PDF Page ${pageNumber}`}
       className="flex flex-col items-center shrink-0"
     >
-      {/* Subtle Page Telemetry Strip */}
-      <div
-        style={{ width: viewportState ? `${viewportState.width}px` : undefined }}
-        className="w-full min-w-[260px] flex items-center justify-between px-2 py-1 bg-surface-container-low border border-b-0 border-outline-variant/40 font-mono text-[10px] text-on-surface-variant select-none"
-      >
-        <span className="tabular-nums">
-          PAGE {pageNumber}
-          {viewportState
-            ? ` · ${Math.round(viewportState.width)}×${Math.round(viewportState.height)}px`
-            : ''}
-        </span>
-        <div className="flex items-center gap-2">
-          {matchesOnPage.length > 0 && (
-            <span className="text-tertiary tabular-nums">
-              {matchesOnPage.length} match{matchesOnPage.length === 1 ? '' : 'es'}
-            </span>
-          )}
-        </div>
-      </div>
-
       {/* Rendered PDF Page Canvas + Search Highlights + Selectable Text Layer */}
       <div
         className={`relative border shadow-2xl overflow-hidden ${PAPER_FRAME_BORDER[colorMode]}`}
         style={{
-          width: viewportState ? `${viewportState.width}px` : '744px',
-          height: viewportState ? `${viewportState.height}px` : '964px',
+          width: viewportState?.width ?? fallbackWidth,
+          height: viewportState?.height ?? fallbackHeight,
         }}
       >
-        <canvas
-          ref={canvasRef}
-          className={`block ${PAPER_FILTER_CLASS[colorMode]}`}
-        />
+        {renderActive && (
+          <canvas
+            ref={canvasRef}
+            className={`block ${PAPER_FILTER_CLASS[colorMode]}`}
+          />
+        )}
 
         {/* Search Match Bounding-Box Highlight Layer */}
         {highlightBoxes.length > 0 && (
@@ -225,17 +239,19 @@ export const PdfPageRenderer: React.FC<PdfPageRendererProps> = ({
         )}
 
         {/* pdfjs-dist Selectable TextLayer */}
-        <div
-          ref={textLayerRef}
-          className={`textLayer ${pointerTool === 'pan' ? 'pointer-events-none' : ''}`}
-        />
+        {renderActive && (
+          <div
+            ref={textLayerRef}
+            className={`textLayer ${pointerTool === 'pan' ? 'pointer-events-none' : ''}`}
+          />
+        )}
 
-        {renderError && (
-          <div className="absolute inset-0 flex items-center justify-center bg-surface-container-lowest/90 p-4 font-mono text-xs text-error">
+        {renderActive && renderError && (
+          <div className="absolute inset-0 flex items-center justify-center bg-surface-container-lowest/90 p-4 font-sans text-[13px] text-error">
             {renderError}
           </div>
         )}
       </div>
     </div>
   );
-};
+});

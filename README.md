@@ -61,7 +61,7 @@ npm test            # node:test unit tests for search + sample PDF generation
 
 ```bash
 npm run package                     # lint + build + vsce package
-code --install-extension lumen-pdf-1.0.0.vsix
+code --install-extension lumen-pdf-1.0.1.vsix
 ```
 
 To publish to the Marketplace, set a real `publisher` in `package.json`, add a `repository` field,

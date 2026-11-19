@@ -1,3 +1,6 @@
+import type { PDFDocumentProxy } from 'pdfjs-dist';
+import type { TextItem } from 'pdfjs-dist/types/src/display/api';
+
 export interface PdfSearchOptions {
   caseSensitive: boolean;
   wholeWord: boolean;
@@ -134,6 +137,50 @@ export function buildExtractedPageFromTextItems(
     fullText,
     items,
   };
+}
+
+export interface PdfTextIndexOptions {
+  signal?: AbortSignal;
+  onProgress?: (pages: ExtractedPdfPage[], failedPages: number[]) => void;
+}
+
+export async function extractPdfTextIndex(
+  pdfDoc: Pick<PDFDocumentProxy, 'numPages' | 'getPage'>,
+  sectionTitlesByPage?: Record<number, string>,
+  { signal, onProgress }: PdfTextIndexOptions = {}
+): Promise<ExtractedPdfPage[]> {
+  const pages: ExtractedPdfPage[] = [];
+  const failedPages: number[] = [];
+  let lastUpdate = 0;
+
+  for (let p = 1; p <= pdfDoc.numPages; p++) {
+    signal?.throwIfAborted();
+    let items: TextItem[] = [];
+    try {
+      const page = await pdfDoc.getPage(p);
+      signal?.throwIfAborted();
+      const content = await page.getTextContent();
+      items = content.items.filter((item): item is TextItem => 'str' in item);
+    } catch (error) {
+      signal?.throwIfAborted();
+      // 单页文本损坏不能阻止后续页面建立索引，空页占位保持页码对应关系。
+      failedPages.push(p);
+    }
+    signal?.throwIfAborted();
+    pages.push(buildExtractedPageFromTextItems(p, items, sectionTitlesByPage?.[p]));
+
+    const now = performance.now();
+    if (p === 1 || p === pdfDoc.numPages || now - lastUpdate >= 100) {
+      onProgress?.(pages.slice(), failedPages.slice());
+      lastUpdate = now;
+    }
+    // 分批让出主线程，避免缓存命中时连续微任务阻塞交互与绘制。
+    if (p % 4 === 0 && p < pdfDoc.numPages) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    }
+  }
+  signal?.throwIfAborted();
+  return pages;
 }
 
 function buildSnippet(

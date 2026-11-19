@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { PDFDocumentProxy } from 'pdfjs-dist';
 import {
   ArrowDown,
@@ -38,19 +38,24 @@ import {
 } from '../utils/pdfState';
 import {
   ExtractedPdfPage,
+  ExtractedPdfTextItem,
   PdfSearchMatch,
   PdfSearchOptions,
 } from '../utils/pdfSearch';
 
 interface PdfReaderCanvasProps {
+  onToolbarHeightChange: (height: number) => void;
   sidebarOpen: boolean;
   onToggleSidebar: () => void;
   pdfDoc: PDFDocumentProxy | null;
   pdfFileName: string;
   isLoadingPdf: boolean;
   pdfLoadError: string | null;
+  backgroundWorkEnabled: boolean;
   totalPages: number;
   extractedPages: ExtractedPdfPage[];
+  searchIndexStatus: string | null;
+  onPageRendered: (doc: PDFDocumentProxy, page: number, phase: 'canvas' | 'text' | 'error') => void;
   currentPage: number;
   zoom: number;
   rotation: number;
@@ -79,6 +84,9 @@ interface PdfReaderCanvasProps {
   onSearchFromSelection: (query: string) => void;
 }
 
+const EMPTY_ITEMS: ExtractedPdfTextItem[] = [];
+const EMPTY_MATCHES: PdfSearchMatch[] = [];
+
 const COLOR_MODE_LABELS: Record<ReadingColorMode, { full: string; short: string }> = {
   'dark-paper': { full: 'Dark Paper', short: 'Dark' },
   'light-paper': { full: 'Light Paper', short: 'Light' },
@@ -94,14 +102,18 @@ interface SelectionPopupState {
 }
 
 export const PdfReaderCanvas: React.FC<PdfReaderCanvasProps> = ({
+  onToolbarHeightChange,
   sidebarOpen,
   onToggleSidebar,
   pdfDoc,
   pdfFileName,
   isLoadingPdf,
   pdfLoadError,
+  backgroundWorkEnabled,
   totalPages,
   extractedPages,
+  searchIndexStatus,
+  onPageRendered,
   currentPage,
   zoom,
   rotation,
@@ -135,10 +147,15 @@ export const PdfReaderCanvas: React.FC<PdfReaderCanvasProps> = ({
   const [selectionPopup, setSelectionPopup] = useState<SelectionPopupState | null>(null);
   const [copiedPopup, setCopiedPopup] = useState(false);
 
+  const toolbarRef = useRef<HTMLDivElement>(null);
   const findInputRef = useRef<HTMLInputElement>(null);
   const colorMenuRef = useRef<HTMLDivElement>(null);
   const viewportRef = useRef<HTMLDivElement>(null);
   const pageElementsRef = useRef<Map<number, HTMLElement>>(new Map());
+  const pageObserverRef = useRef<IntersectionObserver | null>(null);
+  const [visiblePages, setVisiblePages] = useState<Set<number>>(() => new Set());
+  const prevDocRef = useRef(pdfDoc);
+  const prevTransformRef = useRef({ zoom, rotation });
   const panDragRef = useRef<{
     active: boolean;
     startX: number;
@@ -149,6 +166,18 @@ export const PdfReaderCanvas: React.FC<PdfReaderCanvasProps> = ({
   const prevLayoutRef = useRef<ViewLayoutMode>(layoutMode);
   const prevPageRef = useRef<number>(currentPage);
   const scrollingFromSpyRef = useRef(false);
+
+  useLayoutEffect(() => {
+    const toolbar = toolbarRef.current;
+    if (!toolbar) return;
+
+    // 同步包含边框的实际高度，工具栏换行时侧栏标签栏也保持对齐。
+    const syncHeight = () => onToolbarHeightChange(toolbar.getBoundingClientRect().height);
+    syncHeight();
+    const observer = new ResizeObserver(syncHeight);
+    observer.observe(toolbar, { box: 'border-box' });
+    return () => observer.disconnect();
+  }, [onToolbarHeightChange]);
 
   useEffect(() => {
     setPageInput(String(currentPage));
@@ -179,51 +208,105 @@ export const PdfReaderCanvas: React.FC<PdfReaderCanvasProps> = ({
   }, [colorMenuOpen]);
 
   const registerPageElement = useCallback((pageNum: number, el: HTMLElement | null) => {
+    const previous = pageElementsRef.current.get(pageNum);
+    if (previous) pageObserverRef.current?.unobserve(previous);
     if (el) {
       pageElementsRef.current.set(pageNum, el);
+      pageObserverRef.current?.observe(el);
     } else {
       pageElementsRef.current.delete(pageNum);
     }
   }, []);
 
+  useEffect(() => {
+    setVisiblePages(new Set());
+    if (!pdfDoc || isLoadingPdf || !backgroundWorkEnabled || layoutMode !== 'continuous') return;
+    // 所有占位页共用一个观察器，屏幕外仅预加载约一页，不保留整本文档的画布。
+    const observer = new IntersectionObserver((entries) => {
+      setVisiblePages((previous) => {
+        const next = new Set(previous);
+        for (const entry of entries) {
+          const page = Number((entry.target as HTMLElement).dataset.pdfPage);
+          if (entry.isIntersecting) next.add(page);
+          else next.delete(page);
+        }
+        return next.size === previous.size && [...next].every((page) => previous.has(page))
+          ? previous : next;
+      });
+    }, { root: viewportRef.current, rootMargin: '800px 0px' });
+    pageObserverRef.current = observer;
+    for (const el of pageElementsRef.current.values()) observer.observe(el);
+    return () => {
+      observer.disconnect();
+      pageObserverRef.current = null;
+    };
+  }, [pdfDoc, isLoadingPdf, backgroundWorkEnabled, layoutMode]);
+
   // Scroll to target page in continuous mode when currentPage jumps externally or mode switches
   useEffect(() => {
+    const documentChanged = prevDocRef.current !== pdfDoc;
+    prevDocRef.current = pdfDoc;
     const modeChanged = prevLayoutRef.current !== layoutMode;
     const pageChanged = prevPageRef.current !== currentPage;
     prevLayoutRef.current = layoutMode;
     prevPageRef.current = currentPage;
 
-    if (scrollingFromSpyRef.current) {
+    if (scrollingFromSpyRef.current && !documentChanged && !modeChanged) {
       scrollingFromSpyRef.current = false;
       return;
     }
 
-    if (layoutMode === 'single' && (modeChanged || pageChanged)) {
+    if (layoutMode === 'single' && (documentChanged || modeChanged || pageChanged)) {
       // A freshly flipped/selected page always presents from its top.
       if (viewportRef.current) viewportRef.current.scrollTop = 0;
-    } else if (layoutMode === 'continuous' && (modeChanged || pageChanged)) {
+    } else if (layoutMode === 'continuous' && (documentChanged || modeChanged || pageChanged)) {
       const targetEl = pageElementsRef.current.get(currentPage);
       if (targetEl && viewportRef.current) {
-        targetEl.scrollIntoView({ block: 'start', behavior: modeChanged ? 'auto' : 'smooth' });
+        targetEl.scrollIntoView({ block: 'start', behavior: 'instant' });
       }
     }
-  }, [currentPage, layoutMode]);
+  }, [currentPage, layoutMode, pdfDoc]);
+
+  useLayoutEffect(() => {
+    const previous = prevTransformRef.current;
+    prevTransformRef.current = { zoom, rotation };
+    if (previous.zoom === zoom && previous.rotation === rotation) return;
+    if (layoutMode !== 'continuous') return;
+    // 页面占位尺寸改变后立即恢复当前页，避免浏览器滚动锚定和页码监听跳到其他页。
+    pageElementsRef.current.get(currentPage)?.scrollIntoView({ block: 'start', behavior: 'instant' });
+  }, [zoom, rotation, currentPage, layoutMode]);
 
   const handleViewportScroll = () => {
     if (layoutMode !== 'continuous' || !viewportRef.current) return;
-    const containerTop = viewportRef.current.getBoundingClientRect().top + 80;
-    let closestPage = currentPage;
-    let bestDist = Infinity;
-
-    for (const [pageNum, el] of pageElementsRef.current.entries()) {
-      const rect = el.getBoundingClientRect();
-      const dist = Math.abs(rect.top - containerTop);
-      if (dist < bestDist) {
-        bestDist = dist;
-        closestPage = pageNum;
+    const viewportBounds = viewportRef.current.getBoundingClientRect();
+    const activeMark = pageElementsRef.current.get(currentPage)?.querySelector('[data-active-match="true"]');
+    if (activeMark) {
+      const bounds = activeMark.getBoundingClientRect();
+      // 搜索结果居中后可能同时露出上一页，命中仍可见时保持其页码。
+      if (bounds.bottom >= viewportBounds.top && bounds.top <= viewportBounds.bottom) return;
+    }
+    const containerTop = viewportBounds.top + 80;
+    let closestPage = 1;
+    let low = 1;
+    let high = totalPages;
+    // 页码与占位元素有序，二分定位避免每次滚动测量整本 PDF 的布局。
+    while (low <= high) {
+      const middle = Math.floor((low + high) / 2);
+      const el = pageElementsRef.current.get(middle);
+      if (!el) break;
+      if (el.getBoundingClientRect().top <= containerTop) {
+        closestPage = middle;
+        low = middle + 1;
+      } else {
+        high = middle - 1;
       }
     }
 
+    const previous = pageElementsRef.current.get(closestPage);
+    const next = pageElementsRef.current.get(closestPage + 1);
+    if (previous && next && Math.abs(next.getBoundingClientRect().top - containerTop) < Math.abs(previous.getBoundingClientRect().top - containerTop)) {
+      closestPage++;
+    }
     if (closestPage !== currentPage) {
       scrollingFromSpyRef.current = true;
       onChangePage(closestPage);
@@ -395,9 +478,10 @@ export const PdfReaderCanvas: React.FC<PdfReaderCanvasProps> = ({
     >
       {/* PDF Reader Primary Action Toolbar */}
       <div
+        ref={toolbarRef}
         role="toolbar"
         aria-label="PDF Reader Toolbar"
-        className="min-h-10 py-1.5 px-2 sm:px-2.5 bg-surface-container border-b border-outline-variant/40 flex flex-wrap items-center justify-between gap-1.5 select-none relative z-20"
+        className="min-h-10 shrink-0 py-1.5 px-2 sm:px-2.5 bg-surface-container border-b border-outline-variant/40 flex flex-wrap items-center justify-between gap-1.5 select-none relative z-20"
       >
         {/* Zone 1 (Left): Sidebar Toggle & Page Navigation */}
         <div className="contents sm:flex sm:items-center sm:gap-1.5 shrink-0">
@@ -430,7 +514,7 @@ export const PdfReaderCanvas: React.FC<PdfReaderCanvasProps> = ({
             >
               <ChevronLeft className="w-3.5 h-3.5" aria-hidden="true" />
             </button>
-            <div className="h-full flex items-center px-1.5 border-x border-outline-variant/30 font-mono text-[11px] tabular-nums">
+            <div className="h-full flex items-center px-1.5 border-x border-outline-variant/30 font-sans text-[13px] tabular-nums">
               <label htmlFor="pdf-page-input" className="sr-only">
                 Current Page Number
               </label>
@@ -444,7 +528,7 @@ export const PdfReaderCanvas: React.FC<PdfReaderCanvasProps> = ({
                 onKeyDown={(e) => {
                   if (e.key === 'Enter') handlePageInputCommit();
                 }}
-                className="w-7 h-5 text-center bg-surface text-primary font-mono text-[11px] font-semibold focus:outline-none focus:ring-1 focus:ring-primary"
+                className="w-9 h-5 text-center bg-surface text-primary font-sans text-[13px] font-semibold tabular-nums focus:outline-none focus:ring-1 focus:ring-primary"
               />
               <span className="text-outline mx-1">/</span>
               <span className="text-on-surface-variant">{totalPages}</span>
@@ -480,7 +564,7 @@ export const PdfReaderCanvas: React.FC<PdfReaderCanvasProps> = ({
               onClick={() => onChangeZoom(100)}
               aria-label="Reset Zoom to 100%"
               title="Reset Zoom to 100%"
-              className="h-full px-1.5 font-mono text-[11px] text-on-surface hover:text-primary hover:bg-surface-container tabular-nums border-x border-outline-variant/30 transition-colors"
+              className="h-full px-1.5 font-sans text-[13px] text-on-surface hover:text-primary hover:bg-surface-container tabular-nums border-x border-outline-variant/30 transition-colors"
             >
               {zoom}%
             </button>
@@ -609,7 +693,7 @@ export const PdfReaderCanvas: React.FC<PdfReaderCanvasProps> = ({
               aria-expanded={colorMenuOpen}
               aria-haspopup="menu"
               title="Reading Color Mode"
-              className="h-8 sm:h-7 px-2 flex items-center gap-1.5 bg-surface-container-lowest hover:bg-surface-container border border-outline-variant/40 border-b-2 border-b-tertiary text-tertiary font-mono text-[11px] transition-colors whitespace-nowrap"
+              className="h-8 sm:h-7 px-2 flex items-center gap-1.5 bg-surface-container-lowest hover:bg-surface-container border border-outline-variant/40 border-b-2 border-b-tertiary text-tertiary font-sans text-[13px] transition-colors whitespace-nowrap"
             >
               {colorMode === 'light-paper' ? (
                 <Sun className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
@@ -636,7 +720,7 @@ export const PdfReaderCanvas: React.FC<PdfReaderCanvasProps> = ({
                       onChangeColorMode(mode);
                       setColorMenuOpen(false);
                     }}
-                    className={`w-full px-3 py-1.5 text-left font-mono text-[11px] flex items-center justify-between hover:bg-surface-container ${
+                    className={`w-full px-3 py-1.5 text-left font-sans text-[13px] flex items-center justify-between hover:bg-surface-container ${
                       colorMode === mode ? 'text-primary font-bold' : 'text-on-surface'
                     }`}
                   >
@@ -717,7 +801,7 @@ export const PdfReaderCanvas: React.FC<PdfReaderCanvasProps> = ({
                 }
               }}
               placeholder="Find in PDF..."
-              className="flex-1 min-w-0 bg-transparent font-mono text-xs text-on-surface focus:outline-none placeholder:text-outline"
+              className="flex-1 min-w-0 bg-transparent font-sans text-[13px] text-on-surface focus:outline-none placeholder:text-outline"
             />
             {searchQuery && (
               <button
@@ -738,7 +822,7 @@ export const PdfReaderCanvas: React.FC<PdfReaderCanvasProps> = ({
               aria-label="Case Sensitive"
               aria-pressed={searchOptions.caseSensitive}
               title="Match Case (Aa)"
-              className={`h-6 px-1.5 font-mono text-[11px] border transition-colors ${
+              className={`h-6 px-1.5 font-sans text-[13px] border transition-colors ${
                 searchOptions.caseSensitive
                   ? 'bg-surface-container-high border-primary text-primary font-bold'
                   : 'bg-surface-container-lowest border-outline-variant/50 text-on-surface-variant hover:text-on-surface'
@@ -752,7 +836,7 @@ export const PdfReaderCanvas: React.FC<PdfReaderCanvasProps> = ({
               aria-label="Whole Word"
               aria-pressed={searchOptions.wholeWord}
               title="Match Whole Word"
-              className={`h-6 px-1.5 font-mono text-[11px] border transition-colors ${
+              className={`h-6 px-1.5 font-sans text-[13px] border transition-colors ${
                 searchOptions.wholeWord
                   ? 'bg-surface-container-high border-primary text-primary font-bold'
                   : 'bg-surface-container-lowest border-outline-variant/50 text-on-surface-variant hover:text-on-surface'
@@ -762,12 +846,17 @@ export const PdfReaderCanvas: React.FC<PdfReaderCanvasProps> = ({
             </button>
           </div>
 
+          {searchIndexStatus && (
+            <span role="status" className="font-sans text-xs text-outline">
+              {searchIndexStatus}
+            </span>
+          )}
           <div className="flex items-center gap-1">
-            <span className="font-mono text-[11px] text-on-surface-variant tabular-nums px-1.5">
+            <span className="font-sans text-[13px] text-on-surface-variant tabular-nums px-1.5">
               {searchQuery.trim()
                 ? totalMatches > 0
                   ? `${activeMatchIndex + 1} / ${totalMatches}`
-                  : '0 matches'
+                  : searchIndexStatus ? '暂无匹配' : '0 matches'
                 : '0 / 0'}
             </span>
             <button
@@ -796,7 +885,7 @@ export const PdfReaderCanvas: React.FC<PdfReaderCanvasProps> = ({
             type="button"
             onClick={() => onSetSearchOpen(false)}
             aria-label="Close Find Bar"
-            className="font-mono text-[11px] text-outline hover:text-on-surface px-2 ml-auto"
+            className="font-sans text-[13px] text-outline hover:text-on-surface px-2 ml-auto"
           >
             Close
           </button>
@@ -832,7 +921,7 @@ export const PdfReaderCanvas: React.FC<PdfReaderCanvasProps> = ({
                 setCopiedPopup(true);
                 setTimeout(() => setCopiedPopup(false), 1200);
               }}
-              className="flex items-center gap-1 px-1.5 py-0.5 hover:bg-surface-container text-[11px] font-mono transition-colors"
+              className="flex items-center gap-1 px-1.5 py-0.5 hover:bg-surface-container text-[13px] font-sans transition-colors"
             >
               <Copy className="w-3 h-3" aria-hidden="true" />
               <span>{copiedPopup ? 'Copied' : 'Copy'}</span>
@@ -843,7 +932,7 @@ export const PdfReaderCanvas: React.FC<PdfReaderCanvasProps> = ({
                 onQuickHighlight(selectionPopup.page, selectionPopup.text);
                 setSelectionPopup(null);
               }}
-              className="flex items-center gap-1 px-1.5 py-0.5 hover:bg-surface-container text-[11px] font-mono text-tertiary transition-colors"
+              className="flex items-center gap-1 px-1.5 py-0.5 hover:bg-surface-container text-[13px] font-sans text-tertiary transition-colors"
             >
               <Highlighter className="w-3 h-3" aria-hidden="true" />
               <span>Highlight</span>
@@ -854,7 +943,7 @@ export const PdfReaderCanvas: React.FC<PdfReaderCanvasProps> = ({
                 onSearchFromSelection(selectionPopup.text.slice(0, 48));
                 setSelectionPopup(null);
               }}
-              className="flex items-center gap-1 px-1.5 py-0.5 hover:bg-surface-container text-[11px] font-mono text-secondary transition-colors"
+              className="flex items-center gap-1 px-1.5 py-0.5 hover:bg-surface-container text-[13px] font-sans text-secondary transition-colors"
             >
               <Search className="w-3 h-3" aria-hidden="true" />
               <span>Search in PDF</span>
@@ -871,14 +960,13 @@ export const PdfReaderCanvas: React.FC<PdfReaderCanvasProps> = ({
         )}
 
         {pdfLoadError ? (
-          <div className="max-w-lg mx-auto w-full p-5 bg-surface-container border border-error/60 font-mono text-xs space-y-2">
+          <div className="max-w-lg mx-auto w-full p-5 bg-surface-container border border-error/60 font-sans text-[13px] space-y-2">
             <div className="text-error font-bold uppercase">PDF Parse Error</div>
             <p className="text-on-surface-variant">{pdfLoadError}</p>
           </div>
         ) : isLoadingPdf || !pdfDoc ? (
-          <div className="flex flex-col items-center justify-center py-20 gap-2 font-mono text-xs text-on-surface-variant">
+          <div className="flex flex-col items-center justify-center py-20 gap-2 font-sans text-[13px] text-on-surface-variant">
             <span className="text-primary font-bold">Loading PDF Document...</span>
-            <span>Parsing pages, outline bookmarks, and searchable text index</span>
           </div>
         ) : (
           <div
@@ -899,8 +987,10 @@ export const PdfReaderCanvas: React.FC<PdfReaderCanvasProps> = ({
                   rotation={rotation}
                   colorMode={colorMode}
                   pointerTool={pointerTool}
-                  extractedItems={extracted?.items ?? []}
-                  matchesOnPage={matchesByPage[pageNumber] ?? []}
+                  renderActive={pageNumber === currentPage || (backgroundWorkEnabled && (layoutMode !== 'continuous' || visiblePages.has(pageNumber)))}
+                  onPageRendered={onPageRendered}
+                  extractedItems={extracted?.items ?? EMPTY_ITEMS}
+                  matchesOnPage={matchesByPage[pageNumber] ?? EMPTY_MATCHES}
                   activeMatchId={activeMatchId}
                   registerPageElement={registerPageElement}
                 />

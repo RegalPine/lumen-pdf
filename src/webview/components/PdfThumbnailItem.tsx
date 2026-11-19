@@ -112,12 +112,12 @@ export const PdfThumbnailItem: React.FC<PdfThumbnailItemProps> = ({
           className={`block ${THUMB_FILTER[colorMode]} ${rendered ? 'opacity-100' : 'opacity-0'}`}
         />
         {!rendered && (
-          <span className="absolute font-mono text-[10px] text-outline tabular-nums">
+          <span className="absolute font-sans text-xs text-outline tabular-nums">
             P.{pageNumber}
           </span>
         )}
       </div>
-      <div className="w-full flex items-center justify-center font-mono text-[10px] tabular-nums">
+      <div className="w-full flex items-center justify-center font-sans text-xs tabular-nums">
         <span className={isActive ? 'text-primary font-bold' : 'text-on-surface'}>
           Page {pageNumber}
         </span>

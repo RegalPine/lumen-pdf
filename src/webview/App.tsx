@@ -28,7 +28,10 @@ import {
   stepMatchIndex,
 } from './utils/pdfSearch';
 import { buildSamplePdfBytes } from './utils/samplePdfBuilder';
+import { PdfLoadTrace } from './utils/pdfLoadDiagnostics';
+import { afterNextPaint } from './utils/pdfRenderScheduling';
 import {
+  decodePdfBytes,
   getVsCodeApi,
   IncomingHostMessage,
   postToVsCodeHost,
@@ -52,6 +55,7 @@ export default function App() {
     typeof window !== 'undefined' ? window.innerWidth >= 768 : true
   );
   const [pdfSidebarTab, setPdfSidebarTab] = useState<PdfSidebarTab>('outline');
+  const [toolbarHeight, setToolbarHeight] = useState(40);
 
   // PDF.js Document State
   const [pdfDoc, setPdfDoc] = useState<PDFDocumentProxy | null>(null);
@@ -68,6 +72,44 @@ export default function App() {
   const [docReady, setDocReady] = useState<boolean>(false);
   const [extractedPages, setExtractedPages] = useState<ExtractedPdfPage[]>([]);
   const activeDestroyRef = useRef<(() => Promise<void>) | null>(null);
+  const activeLoadRef = useRef<AbortController | null>(null);
+  const indexAbortRef = useRef<AbortController | null>(null);
+  const activeDocRef = useRef<PDFDocumentProxy | null>(null);
+  const [firstPageRendered, setFirstPageRendered] = useState(false);
+  const [backgroundReadyDoc, setBackgroundReadyDoc] = useState<PDFDocumentProxy | null>(null);
+  const backgroundWorkEnabled = pdfDoc !== null && backgroundReadyDoc === pdfDoc;
+  const [isOutlineLoading, setIsOutlineLoading] = useState(true);
+  const [isIndexing, setIsIndexing] = useState(false);
+  const [indexError, setIndexError] = useState<string | null>(null);
+  const pendingSearchJumpRef = useRef(false);
+  const [initialLoadTrace] = useState(() => new PdfLoadTrace('waiting'));
+  const loadTraceRef = useRef(initialLoadTrace);
+  const firstRenderPageRef = useRef(1);
+  const traceSequenceRef = useRef(0);
+  const beginLoadTrace = useCallback((id = `webview-${++traceSequenceRef.current}`) => {
+    activeLoadRef.current?.abort();
+    indexAbortRef.current?.abort();
+    activeDocRef.current = null;
+    setPdfDoc(null);
+    setDocReady(false);
+    setTotalPages(0);
+    setOutline([]);
+    setExtractedPages([]);
+    setFirstPageRendered(false);
+    setBackgroundReadyDoc(null);
+    setIsOutlineLoading(true);
+    setIsIndexing(false);
+    setIndexError(null);
+    setIsLoadingPdf(true);
+    setPdfLoadError(null);
+    const trace = new PdfLoadTrace(id, () => performance.now(), (stage, elapsedMs) => {
+      if (stage !== 'waiting-host') {
+        postToVsCodeHost({ type: 'pdfLoadStage', requestId: loadTraceRef.current.requestId, stage, elapsedMs });
+      }
+    });
+    loadTraceRef.current = trace;
+    return trace;
+  }, []);
 
   // Reader View State (restores VS Code Webview state when running inside VS Code)
   const initialVsCodeState = getVsCodeApi()?.getState<{
@@ -78,6 +120,8 @@ export default function App() {
   const [currentPage, setCurrentPage] = useState<number>(
     initialVsCodeState?.currentPage ?? 1
   );
+  const currentPageRef = useRef(currentPage);
+  currentPageRef.current = currentPage;
   const [zoom, setZoom] = useState<number>(initialVsCodeState?.zoom ?? 100);
   const [rotation, setRotation] = useState<number>(0);
   const [colorMode, setColorMode] = useState<ReadingColorMode>(
@@ -100,43 +144,61 @@ export default function App() {
 
   const loadPdfStream = useCallback(
     async (
-      bytes: Uint8Array,
+      data: unknown,
       fileName: string,
       custom: boolean,
-      initialPage: number
+      initialPage: number,
+      trace = beginLoadTrace(),
     ) => {
+      activeLoadRef.current?.abort();
+      indexAbortRef.current?.abort();
+      const controller = new AbortController();
+      activeLoadRef.current = controller;
+      activeDocRef.current = null;
+      const previousDestroy = activeDestroyRef.current;
+      activeDestroyRef.current = null;
       setIsLoadingPdf(true);
+      setPdfFileName(fileName);
       setPdfLoadError(null);
+      setDocReady(false);
+      setPdfDoc(null);
+      setTotalPages(0);
+      setOutline([]);
+      setExtractedPages([]);
+      setFirstPageRendered(false);
+      setBackgroundReadyDoc(null);
+      setIsOutlineLoading(true);
+      setIsIndexing(false);
+      setIndexError(null);
+      setActiveMatchIndex(0);
+      pendingSearchJumpRef.current = false;
       try {
-        const { doc, destroy } = await loadPdfDocumentFromBytes(bytes);
-
-        if (activeDestroyRef.current) {
-          try {
-            await activeDestroyRef.current();
-          } catch {
-            // ignore cleanup errors
-          }
+        if (previousDestroy) trace.mark('closing');
+        await previousDestroy?.().catch(() => {});
+        controller.signal.throwIfAborted();
+        trace.mark('decoding');
+        const bytes = decodePdfBytes(data);
+        trace.update({ bytes: bytes.byteLength });
+        // PDF.js 会转移缓冲区，存储键必须在转移前记录文件长度。
+        const key = custom ? `${fileName}:${bytes.byteLength}` : SAMPLE_PDF_NAME;
+        const { doc, destroy } = await loadPdfDocumentFromBytes(bytes, controller.signal, stage => {
+          if (!controller.signal.aborted) trace.mark(stage);
+        });
+        if (controller.signal.aborted) {
+          await destroy();
+          return;
         }
         activeDestroyRef.current = destroy;
-
-        const sectionTitles: Record<number, string> = {};
-        if (!custom) {
-          for (const p of PDF_PAGES) {
-            sectionTitles[p.page] = p.sectionTitle;
-          }
-        }
-
-        const pagesText = await extractAllPagesText(doc, sectionTitles);
-        const docOutline = await extractOutlineFromPdf(doc, pagesText);
-
-        const key = custom ? `${fileName}:${bytes.byteLength}` : SAMPLE_PDF_NAME;
+        activeDocRef.current = doc;
+        firstRenderPageRef.current = Math.max(1, Math.min(doc.numPages, initialPage));
+        trace.update({ pages: doc.numPages });
+        trace.mark('rendering');
         setPdfFileName(fileName);
         setDocStorageKey(key);
         setIsCustomPdf(custom);
         setPdfDoc(doc);
         setTotalPages(doc.numPages);
-        setExtractedPages(pagesText);
-        setOutline(docOutline);
+        setIsIndexing(true);
         setCurrentPage(Math.max(1, Math.min(doc.numPages, initialPage)));
         setDocReady(true);
 
@@ -153,6 +215,8 @@ export default function App() {
           )
         );
       } catch (err) {
+        if (controller.signal.aborted) return;
+        trace.mark('error');
         const msg = err instanceof Error ? err.message : 'Unable to parse PDF binary.';
         setPdfLoadError(msg);
         // Never leave a failed document showing the previous one's structure.
@@ -161,47 +225,163 @@ export default function App() {
         setTotalPages(0);
         setDocReady(false);
       } finally {
-        setIsLoadingPdf(false);
+        if (!controller.signal.aborted) setIsLoadingPdf(false);
       }
     },
-    []
+    [beginLoadTrace]
   );
+
+  const handlePageRendered = useCallback((doc: PDFDocumentProxy, page: number, phase: 'canvas' | 'text' | 'error') => {
+    if (activeDocRef.current !== doc) return;
+    const trace = loadTraceRef.current;
+    if (trace.snapshot().stage === 'rendering') {
+      // 首屏尚未完成时用户可能已跳页，不能把邻页预加载当作首屏成功。
+      if (page !== currentPageRef.current) return;
+      firstRenderPageRef.current = page;
+    }
+    if (page !== firstRenderPageRef.current) return;
+    if (phase === 'canvas') {
+      trace.mark('ready');
+      setFirstPageRendered(true);
+    } else {
+      trace.textLayer(phase === 'error');
+      if (phase === 'error') {
+        trace.mark('error');
+        // 当前页损坏也要解除后台门槛，允许通过目录或缩略图继续阅读其他页。
+        setFirstPageRendered(true);
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!pdfDoc || !firstPageRendered) return;
+    return afterNextPaint(() => {
+      // 延迟回调只能解锁所属文档，切换文件后不得影响新文档的首屏。
+      if (activeDocRef.current === pdfDoc) setBackgroundReadyDoc(pdfDoc);
+    });
+  }, [pdfDoc, firstPageRendered]);
+
+  useEffect(() => {
+    if (!pdfDoc || !backgroundWorkEnabled) return;
+    let cancelled = false;
+    // 目录解析延后到首屏获得绘制机会后，异常目录不应阻止正文阅读。
+    extractOutlineFromPdf(pdfDoc).then((nodes) => {
+      if (!cancelled && activeDocRef.current === pdfDoc) setOutline(nodes);
+    }).catch(() => {}).finally(() => {
+      if (!cancelled && activeDocRef.current === pdfDoc) setIsOutlineLoading(false);
+    });
+    return () => { cancelled = true; };
+  }, [pdfDoc, backgroundWorkEnabled]);
+
+  useEffect(() => {
+    if (!pdfDoc || !backgroundWorkEnabled) return;
+    const controller = new AbortController();
+    indexAbortRef.current = controller;
+    const sectionTitles = isCustomPdf
+      ? undefined
+      : Object.fromEntries(PDF_PAGES.map((page) => [page.page, page.sectionTitle]));
+    // 与目录和邻页共用首屏门槛，避免邻页文字层提前触发全文索引。
+    extractAllPagesText(pdfDoc, sectionTitles, {
+      signal: controller.signal,
+      onProgress: (pages, failedPages) => {
+        if (controller.signal.aborted) return;
+        setExtractedPages(pages);
+        setIndexError(failedPages.length ? `${failedPages.length} 页无法提取文本，搜索结果可能不完整。` : null);
+      },
+    }).then(() => {
+      if (!controller.signal.aborted) setIsIndexing(false);
+    }).catch(() => {
+      if (!controller.signal.aborted) {
+        setIsIndexing(false);
+        setIndexError('搜索索引建立失败，仍可继续阅读 PDF。');
+      }
+    });
+    return () => controller.abort();
+  }, [pdfDoc, backgroundWorkEnabled, isCustomPdf]);
+
+  const displayOutline = useMemo(() => outline.map((node) => {
+    const page = extractedPages[node.page - 1];
+    return node.id === `page-${node.page}` && page && page.sectionTitle !== `Page ${node.page}`
+      ? { ...node, title: `${node.page}. ${page.sectionTitle.slice(0, 44)}` }
+      : node;
+  }), [outline, extractedPages]);
+  const searchIndexStatus = isIndexing
+    ? `正在建立搜索索引 ${extractedPages.length} / ${totalPages} 页，结果陆续更新`
+    : indexError;
 
   // Listen for VS Code Extension Host messages or load standalone sample PDF
   // (totalPages is read through a ref so a late document parse cannot re-run
   // this effect and re-load / reset the page while the user is reading).
   const totalPagesRef = useRef(0);
+  totalPagesRef.current = totalPages;
   useEffect(() => {
-    const insideVsCode = postToVsCodeHost({ type: 'ready' });
-    if (!insideVsCode) {
-      const sampleBytes = buildSamplePdfBytes();
-      loadPdfStream(sampleBytes, SAMPLE_PDF_NAME, false, 1);
-    }
-
+    let hostRequestId = 0;
     const handleHostMessage = async (event: MessageEvent<IncomingHostMessage>) => {
       const msg = event.data;
       if (!msg || typeof msg !== 'object') return;
-      if (msg.type === 'loadPdf') {
-        if (msg.data) {
-          const bytes =
-            msg.data instanceof Uint8Array
-              ? msg.data
-              : msg.data instanceof ArrayBuffer
-              ? new Uint8Array(msg.data)
-              : new Uint8Array(msg.data);
-          await loadPdfStream(bytes, msg.fileName || 'document.pdf', true, 1);
+      if (msg.type === 'pdfLoadProgress') {
+        if (msg.stage === 'reading-file') {
+          hostRequestId++;
+          const trace = loadTraceRef.current.snapshot().stage === 'waiting-host'
+            ? loadTraceRef.current : beginLoadTrace(msg.requestId);
+          trace.requestId = msg.requestId;
+          trace.mark('reading-file');
+          setIsLoadingPdf(true);
+          setPdfLoadError(null);
+        } else if (msg.requestId === loadTraceRef.current.requestId && msg.stage === 'transferring') {
+          loadTraceRef.current.mark('transferring');
+        }
+      } else if (msg.type === 'pdfLoadTiming') {
+        if (msg.requestId === loadTraceRef.current.requestId) loadTraceRef.current.update({ host: msg.timings });
+      } else if (msg.type === 'pdfLoadError') {
+        if (msg.requestId !== loadTraceRef.current.requestId) return;
+        hostRequestId++;
+        activeLoadRef.current?.abort();
+        indexAbortRef.current?.abort();
+        activeDocRef.current = null;
+        setFirstPageRendered(false);
+        setBackgroundReadyDoc(null);
+        void activeDestroyRef.current?.().catch(() => {});
+        activeDestroyRef.current = null;
+        loadTraceRef.current.mark('error');
+        setIsLoadingPdf(false);
+        setPdfLoadError(msg.message);
+        setPdfDoc(null);
+        setDocReady(false);
+        setTotalPages(0);
+        setOutline([]);
+        setExtractedPages([]);
+        setIsIndexing(false);
+      } else if (msg.type === 'loadPdf') {
+        if (msg.requestId && msg.requestId !== loadTraceRef.current.requestId) return;
+        const requestId = ++hostRequestId;
+        const trace = msg.requestId ? loadTraceRef.current : beginLoadTrace();
+        trace.update({ host: msg.timings });
+        if (msg.requestId) postToVsCodeHost({ type: 'pdfLoadReceived', requestId: msg.requestId });
+        if (msg.data !== undefined) {
+          await loadPdfStream(msg.data, msg.fileName || 'document.pdf', true, 1, trace);
         } else if (msg.url) {
+          trace.mark('fetching');
+          setIsLoadingPdf(true);
+          setPdfLoadError(null);
           try {
             const res = await fetch(msg.url);
+            if (!res.ok) throw new Error(`PDF request failed: ${res.status}`);
             const buf = await res.arrayBuffer();
+            if (requestId !== hostRequestId) return;
             const inferredName =
               msg.fileName || msg.url.split('/').pop()?.split('?')[0] || 'document.pdf';
-            await loadPdfStream(new Uint8Array(buf), inferredName, true, 1);
+            await loadPdfStream(new Uint8Array(buf), inferredName, true, 1, trace);
           } catch (err) {
+            if (requestId !== hostRequestId) return;
+            trace.mark('error');
+            setIsLoadingPdf(false);
             setPdfLoadError(
               err instanceof Error ? err.message : 'Failed to fetch PDF from host.'
             );
           }
+        } else {
+          await loadPdfStream(undefined, msg.fileName || 'document.pdf', true, 1, trace);
         }
       } else if (msg.type === 'toggleColorMode') {
         const order: ReadingColorMode[] = ['dark-paper', 'light-paper', 'sepia', 'inverted'];
@@ -212,15 +392,22 @@ export default function App() {
     };
 
     window.addEventListener('message', handleHostMessage);
+    const trace = beginLoadTrace();
+    const insideVsCode = postToVsCodeHost({ type: 'ready' });
+    if (!insideVsCode) loadPdfStream(buildSamplePdfBytes(), SAMPLE_PDF_NAME, false, 1, trace);
 
     return () => {
       window.removeEventListener('message', handleHostMessage);
+      hostRequestId++;
+      activeLoadRef.current?.abort();
+      indexAbortRef.current?.abort();
+      activeDocRef.current = null;
       if (activeDestroyRef.current) {
         activeDestroyRef.current().catch(() => {});
         activeDestroyRef.current = null;
       }
     };
-  }, [loadPdfStream]);
+  }, [loadPdfStream, beginLoadTrace]);
 
   // Sync Webview reading state to VS Code host (no-op in standalone preview)
   useEffect(() => {
@@ -248,6 +435,13 @@ export default function App() {
     () => searchPdfPages(extractedPages, pdfSearchQuery, pdfSearchOptions),
     [extractedPages, pdfSearchQuery, pdfSearchOptions]
   );
+
+  useEffect(() => {
+    if (!pendingSearchJumpRef.current || pdfSearchResult.totalMatches === 0) return;
+    pendingSearchJumpRef.current = false;
+    setActiveMatchIndex(0);
+    setCurrentPage(pdfSearchResult.flatMatches[0].page);
+  }, [pdfSearchResult]);
 
   const matchesByPage = useMemo(() => {
     const map: Record<number, PdfSearchMatch[]> = {};
@@ -330,6 +524,7 @@ export default function App() {
     (nextQuery: string) => {
       setPdfSearchQuery(nextQuery);
       const nextRes = searchPdfPages(extractedPages, nextQuery, pdfSearchOptions);
+      pendingSearchJumpRef.current = Boolean(nextQuery.trim()) && nextRes.totalMatches === 0;
       if (nextRes.totalMatches > 0) {
         const onCurrentIdx = nextRes.flatMatches.findIndex((m) => m.page === currentPage);
         syncMatchPage(
@@ -351,6 +546,7 @@ export default function App() {
     };
     setPdfSearchOptions(nextOpts);
     const nextRes = searchPdfPages(extractedPages, pdfSearchQuery, nextOpts);
+    pendingSearchJumpRef.current = Boolean(pdfSearchQuery.trim()) && nextRes.totalMatches === 0;
     syncMatchPage(nextRes.totalMatches, nextRes.flatMatches, 0);
   }, [extractedPages, pdfSearchOptions, pdfSearchQuery, syncMatchPage]);
 
@@ -361,6 +557,7 @@ export default function App() {
     };
     setPdfSearchOptions(nextOpts);
     const nextRes = searchPdfPages(extractedPages, pdfSearchQuery, nextOpts);
+    pendingSearchJumpRef.current = Boolean(pdfSearchQuery.trim()) && nextRes.totalMatches === 0;
     syncMatchPage(nextRes.totalMatches, nextRes.flatMatches, 0);
   }, [extractedPages, pdfSearchOptions, pdfSearchQuery, syncMatchPage]);
 
@@ -460,17 +657,21 @@ export default function App() {
           className="w-[276px] max-md:w-72 shrink-0 bg-surface-container-low border-r border-outline-variant/40 flex flex-col min-h-0 z-30 max-md:absolute max-md:left-0 max-md:top-0 max-md:bottom-0 max-md:shadow-2xl"
         >
           <PdfSidebar
+            headerHeight={toolbarHeight}
             activeTab={pdfSidebarTab}
             onSelectTab={setPdfSidebarTab}
             pdfDoc={pdfDoc}
             totalPages={totalPages}
             colorMode={colorMode}
-            outline={outline}
+            outline={displayOutline}
+            isOutlineLoading={isOutlineLoading}
+            backgroundWorkEnabled={backgroundWorkEnabled}
             currentPage={currentPage}
             annotations={annotations}
             bookmarks={bookmarks}
             searchQuery={pdfSearchQuery}
             searchResult={pdfSearchResult}
+            searchIndexStatus={searchIndexStatus}
             activeMatchIndex={clampedMatchIndex}
             onJumpToPage={(page) => setCurrentPage(page)}
             onAddAnnotation={handleAddAnnotation}
@@ -486,14 +687,18 @@ export default function App() {
       {/* Main Full-Bleed PDF Reader Canvas */}
       <main className="flex-1 flex flex-col min-w-0 min-h-0">
         <PdfReaderCanvas
+          onToolbarHeightChange={setToolbarHeight}
           sidebarOpen={sidebarOpen}
           onToggleSidebar={() => setSidebarOpen((s) => !s)}
           pdfDoc={pdfDoc}
           pdfFileName={pdfFileName}
           isLoadingPdf={isLoadingPdf}
           pdfLoadError={pdfLoadError}
+          backgroundWorkEnabled={backgroundWorkEnabled}
           totalPages={totalPages}
           extractedPages={extractedPages}
+          searchIndexStatus={searchIndexStatus}
+          onPageRendered={handlePageRendered}
           currentPage={currentPage}
           zoom={zoom}
           rotation={rotation}
